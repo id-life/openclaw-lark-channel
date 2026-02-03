@@ -9,13 +9,66 @@ import type { LarkRuntimeState } from './types.js';
 
 // ─── Types ───────────────────────────────────────────────────────
 
+// Full plugin runtime interface matching OpenClaw's createPluginRuntime()
 export interface LarkPluginRuntime {
   channel: {
     text: {
       chunkMarkdownText: (text: string, limit: number) => string[];
     };
+    reply: {
+      dispatchReplyWithBufferedBlockDispatcher: (params: {
+        ctx: Record<string, unknown>;
+        cfg: Record<string, unknown>;
+        dispatcherOptions: {
+          responsePrefix?: string;
+          responsePrefixContextProvider?: () => Record<string, unknown>;
+          deliver: (payload: { text?: string; mediaUrl?: string }, info: { kind: string }) => Promise<void>;
+          onSkip?: (payload: unknown, info: { reason: string }) => void;
+          onError?: (err: Error, info: { kind: string }) => void;
+          onReplyStart?: () => void;
+        };
+        replyOptions?: {
+          skillFilter?: unknown;
+          onPartialReply?: (payload: { text?: string }) => void;
+          onReasoningStream?: (payload: { text?: string }) => void;
+          disableBlockStreaming?: boolean;
+          onModelSelected?: (ctx: { provider: string; model: string; thinkLevel?: string }) => void;
+        };
+      }) => Promise<{ queuedFinal?: boolean }>;
+      finalizeInboundContext: (ctx: Record<string, unknown>) => Record<string, unknown>;
+      createReplyDispatcherWithTyping: (options: unknown) => unknown;
+    };
+    routing: {
+      resolveAgentRoute: (params: {
+        cfg: Record<string, unknown>;
+        channel: string;
+        accountId?: string;
+        peer?: { kind: 'group' | 'dm'; id: string };
+      }) => {
+        sessionKey: string;
+        mainSessionKey: string;
+        agentId: string;
+        accountId?: string;
+      };
+    };
+    session: {
+      resolveStorePath: () => string | null;
+      recordInboundSession: (params: {
+        storePath: string | null;
+        sessionKey: string;
+        ctx: Record<string, unknown>;
+        updateLastRoute?: {
+          sessionKey: string;
+          channel: string;
+          to: string;
+          accountId?: string;
+        };
+        onRecordError?: (err: Error) => void;
+      }) => Promise<void>;
+    };
   };
   config: {
+    loadConfig: () => Record<string, unknown>;
     writeConfigFile: (cfg: unknown) => Promise<void>;
   };
   logging: {

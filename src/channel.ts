@@ -23,6 +23,7 @@ import { WebhookHandler } from './webhook.js';
 import {
   setAccountRuntime,
   createDefaultRuntimeState,
+  getLarkRuntime,
 } from './runtime.js';
 import { buildChannelConfigSchema } from 'openclaw/plugin-sdk';
 import { LarkConfigSchema } from './config-schema.js';
@@ -32,7 +33,6 @@ import { LarkConfigSchema } from './config-schema.js';
 const DEFAULT_ACCOUNT_ID = 'default';
 const DEFAULT_WEBHOOK_PORT = 3000;
 const CONSUMER_INTERVAL_MS = 500;
-const GATEWAY_TIMEOUT_MS = 180000; // 3 minutes
 
 // ─── Config Helpers ──────────────────────────────────────────────
 
@@ -137,14 +137,15 @@ let outboundConsumerRunning = false;
 let inboundInterval: NodeJS.Timeout | null = null;
 let outboundInterval: NodeJS.Timeout | null = null;
 
-// NOTE: Reset triggers (/new, /reset, /start) are now handled by the gateway
-// via deliver=true. No manual detection needed.
+// ⚡ CRITICAL FIX: Use dispatchReplyWithBufferedBlockDispatcher like Telegram
+// This ensures session info, usage footer, reasoning blocks all work correctly.
+// The WebSocket agent method bypasses the dispatch system which is why it was broken.
 
 async function processInboundQueue(
   queue: MessageQueue,
-  gatewayToken: string,
-  gatewayPort: number,
-  agentId: string
+  _gatewayToken: string,
+  _gatewayPort: number,
+  _agentId: string
 ): Promise<void> {
   if (!inboundConsumerRunning) return;
 
@@ -154,31 +155,92 @@ async function processInboundQueue(
     queue.markInboundProcessing(msg.id);
 
     try {
-      const attachments = msg.attachments_json ? JSON.parse(msg.attachments_json) : undefined;
-      const idempotencyKey = `inbound-${msg.message_id}`;
-
       console.log(`[INBOUND] Processing #${msg.id} | attempt ${msg.retries + 1}`);
 
-      // ⚡ KEY FIX: Use deliver=true so gateway handles everything:
-      // - New session message
-      // - Usage footer  
-      // - Reasoning blocks
-      // - Verbose output
-      // Gateway will call our outbound.sendText to deliver responses
-      await askGateway({
-        message: msg.message_text,
-        attachments,
-        sessionKey: msg.session_key,
-        chatId: msg.chat_id,
-        idempotencyKey,
-        gatewayToken,
-        gatewayPort,
-        agentId,
-        deliver: true,  // Let gateway handle delivery via our outbound.sendText
+      // Get the plugin runtime with dispatch system
+      const pluginRuntime = getLarkRuntime();
+      const cfg = pluginRuntime.config.loadConfig() as Record<string, unknown>;
+      
+      // Derive chat type from chat_id pattern (og_ = group, oc_ = DM)
+      const isGroup = msg.chat_id.startsWith('og_');
+      const chatType: 'direct' | 'group' = isGroup ? 'group' : 'direct';
+      
+      // Resolve routing - use same signature as Telegram
+      const route = pluginRuntime.channel.routing.resolveAgentRoute({
+        cfg,
+        channel: 'lark',
+        accountId: 'default',
+        peer: {
+          kind: isGroup ? 'group' : 'dm',
+          id: msg.chat_id,
+        },
       });
 
-      // Mark inbound complete - no manual outbound queueing needed
-      // The gateway's dispatch system handles all reply delivery
+      // Build context like Telegram does - THIS IS THE KEY
+      const ctx = pluginRuntime.channel.reply.finalizeInboundContext({
+        Body: msg.message_text,
+        BodyForAgent: msg.message_text,
+        BodyForCommands: msg.message_text,
+        RawBody: msg.message_text,
+        CommandBody: msg.message_text,
+        SessionKey: route.sessionKey,
+        Provider: 'lark',
+        Surface: 'lark',
+        // ⚡ CRITICAL: These two fields enable session info routing
+        OriginatingChannel: 'lark',
+        OriginatingTo: msg.chat_id,
+        ChatType: chatType,
+        CommandAuthorized: true,
+        MessageSid: msg.message_id,
+        SenderId: msg.chat_id,
+        From: msg.chat_id,
+      });
+
+      // Record session metadata
+      const storePath = pluginRuntime.channel.session.resolveStorePath();
+      await pluginRuntime.channel.session.recordInboundSession({
+        storePath,
+        sessionKey: route.sessionKey,
+        ctx,
+        updateLastRoute: chatType !== 'group' ? {
+          sessionKey: route.mainSessionKey,
+          channel: 'lark',
+          to: msg.chat_id,
+          accountId: route.accountId,
+        } : undefined,
+        onRecordError: (err) => {
+          console.error('[INBOUND] Failed to record session:', err.message);
+        },
+      });
+
+      // Get the Lark client for delivery
+      const client = getLarkClient();
+
+      // Use the dispatch system - SAME AS TELEGRAM
+      await pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx,
+        cfg,
+        dispatcherOptions: {
+          deliver: async (payload, info) => {
+            if (info.kind !== 'final') return;
+            
+            const text = payload.text?.trim();
+            if (!text) return;
+
+            console.log(`[DISPATCH] Delivering ${info.kind}: ${text.length} chars`);
+            
+            // Send to Lark
+            await sendToLark(client, msg.chat_id, text, route.sessionKey);
+          },
+          onError: (err, info) => {
+            console.error(`[DISPATCH] ${info.kind} error:`, err.message);
+          },
+        },
+        replyOptions: {
+          disableBlockStreaming: true,
+        },
+      });
+
       queue.markInboundCompleted(msg.id, 'delivered');
     } catch (err) {
       console.error(`[INBOUND] Failed #${msg.id}:`, (err as Error).message);
@@ -257,146 +319,6 @@ function stopConsumers(): void {
     clearInterval(outboundInterval);
     outboundInterval = null;
   }
-}
-
-// ─── Gateway Communication ───────────────────────────────────────
-
-async function askGateway(params: {
-  message: string;
-  attachments?: Array<{ mimeType: string; content: string }>;
-  sessionKey: string;
-  chatId: string;
-  idempotencyKey: string;
-  gatewayToken: string;
-  gatewayPort: number;
-  agentId: string;
-  deliver?: boolean;  // If true, gateway handles delivery via channel outbound
-}): Promise<string> {
-  // Import WebSocket dynamically to avoid bundling issues
-  const { default: WebSocket } = await import('ws');
-
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${params.gatewayPort}`);
-    let runId: string | null = null;
-    let buf = '';
-    let done = false;
-    let timeout: NodeJS.Timeout | null = null;
-
-    const finish = (err: Error | null, result?: string) => {
-      if (done) return;
-      done = true;
-      if (timeout) clearTimeout(timeout);
-      try { ws.close(); } catch { /* ignore */ }
-      err ? reject(err) : resolve(result ?? '');
-    };
-
-    timeout = setTimeout(() => finish(new Error('Gateway timeout')), GATEWAY_TIMEOUT_MS);
-
-    ws.on('error', (e) => {
-      const err = new Error((e as Error).message) as Error & { retryable?: boolean };
-      err.retryable = true;
-      finish(err);
-    });
-
-    ws.on('close', (code) => {
-      if (!done) {
-        const err = new Error(`WebSocket closed (code ${code})`) as Error & { retryable?: boolean };
-        err.retryable = code === 1012 || code === 1006 || code === 1001;
-        finish(err);
-      }
-    });
-
-    ws.on('message', (raw) => {
-      let msg: {
-        type?: string;
-        id?: string;
-        event?: string;
-        ok?: boolean;
-        error?: { message?: string };
-        payload?: {
-          runId?: string;
-          stream?: string;
-          data?: { text?: string; delta?: string; phase?: string; message?: string };
-        };
-      };
-
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-
-      if (msg.type === 'event' && msg.event === 'connect.challenge') {
-        ws.send(JSON.stringify({
-          type: 'req',
-          id: 'connect',
-          method: 'connect',
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: { id: 'gateway-client', version: '1.0.0', platform: 'linux', mode: 'backend' },
-            role: 'operator',
-            scopes: ['operator.read', 'operator.write'],
-            auth: { token: params.gatewayToken },
-            locale: 'en-US',
-            userAgent: 'lark-channel/1.0',
-          },
-        }));
-        return;
-      }
-
-      if (msg.type === 'res' && msg.id === 'connect') {
-        if (!msg.ok) {
-          finish(new Error(msg.error?.message ?? 'connect failed'));
-          return;
-        }
-        ws.send(JSON.stringify({
-          type: 'req',
-          id: 'agent',
-          method: 'agent',
-          params: {
-            message: params.message,
-            agentId: params.agentId,
-            sessionKey: params.sessionKey,
-            deliver: params.deliver ?? false,
-            idempotencyKey: params.idempotencyKey,
-            attachments: params.attachments,
-            // ⚡ CRITICAL: Set channel context so gateway knows where to route replies
-            // When deliver=true, gateway uses these to call our outbound.sendText
-            channel: 'lark',
-            replyChannel: 'lark',
-            to: params.chatId,
-          },
-        }));
-        return;
-      }
-
-      if (msg.type === 'res' && msg.id === 'agent') {
-        if (!msg.ok) {
-          finish(new Error(msg.error?.message ?? 'agent error'));
-          return;
-        }
-        if (msg.payload?.runId) runId = msg.payload.runId;
-        return;
-      }
-
-      if (msg.type === 'event' && msg.event === 'agent') {
-        const p = msg.payload;
-        if (!p || (runId && p.runId !== runId)) return;
-
-        if (p.stream === 'assistant') {
-          const d = p.data ?? {};
-          if (typeof d.text === 'string') buf = d.text;
-          else if (typeof d.delta === 'string') buf += d.delta;
-        }
-
-        if (p.stream === 'lifecycle') {
-          if (p.data?.phase === 'end') finish(null, buf.trim());
-          if (p.data?.phase === 'error') finish(new Error(p.data?.message ?? 'agent error'));
-        }
-      }
-    });
-  });
 }
 
 // ─── Send to Lark ────────────────────────────────────────────────
