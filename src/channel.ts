@@ -10,6 +10,9 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import os from 'node:os';
 import type {
   LarkChannelConfig,
   ResolvedLarkAccount,
@@ -145,17 +148,76 @@ let outboundInterval: NodeJS.Timeout | null = null;
 // Support for large attachments up to 200MB as per Boyang's requirement
 const MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024; // 200 MB
 
+// Directory to save file attachments
+const LARK_MEDIA_DIR = path.join(os.homedir(), '.openclaw', 'media', 'lark-inbound');
+
+// Attachment type for OpenClaw - supports images and files
+type AttachmentForAgent = 
+  | { type: 'image'; data: string; mimeType: string }
+  | { type: 'file'; path: string; mimeType: string; fileName?: string };
+
+/**
+ * Save a file attachment to disk and return the path.
+ * This allows the agent to access files via the read tool.
+ */
+function saveFileAttachment(base64: string, mimeType: string, fileName?: string): string {
+  // Ensure directory exists
+  if (!fs.existsSync(LARK_MEDIA_DIR)) {
+    fs.mkdirSync(LARK_MEDIA_DIR, { recursive: true, mode: 0o700 });
+  }
+  
+  // Determine extension from mime type or filename
+  const mimeExtensions: Record<string, string> = {
+    'application/zip': '.zip',
+    'application/pdf': '.pdf',
+    'application/msword': '.doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+    'application/vnd.ms-excel': '.xls',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+    'text/plain': '.txt',
+    'text/csv': '.csv',
+    'application/json': '.json',
+    'audio/mpeg': '.mp3',
+    'audio/wav': '.wav',
+    'audio/opus': '.opus',
+    'video/mp4': '.mp4',
+  };
+  
+  let ext = mimeExtensions[mimeType] || '';
+  if (!ext && fileName) {
+    const match = fileName.match(/\.[^.]+$/);
+    if (match) ext = match[0];
+  }
+  
+  // Create filename with original name if available
+  const uuid = crypto.randomUUID();
+  let finalName: string;
+  if (fileName) {
+    const baseName = path.parse(fileName).name.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 50);
+    finalName = `${baseName}---${uuid}${ext}`;
+  } else {
+    finalName = `${uuid}${ext}`;
+  }
+  
+  const filePath = path.join(LARK_MEDIA_DIR, finalName);
+  const buffer = Buffer.from(base64, 'base64');
+  fs.writeFileSync(filePath, buffer, { mode: 0o600 });
+  
+  return filePath;
+}
+
 /**
  * Parse and validate attachments, converting to the format expected by OpenClaw.
  * Handles large files up to 200MB.
+ * Supports both images and files (documents, archives, etc.)
  */
 function parseAttachmentsForAgent(
   attachmentsJson: string | null,
   log: { info: (msg: string) => void; warn?: (msg: string) => void } = { info: console.log, warn: console.warn }
-): Array<{ type: 'image'; data: string; mimeType: string }> {
+): Array<AttachmentForAgent> {
   if (!attachmentsJson) return [];
 
-  let attachments: Array<{ mimeType: string; content: string }>;
+  let attachments: Array<{ mimeType: string; content: string; fileName?: string }>;
   try {
     attachments = JSON.parse(attachmentsJson);
   } catch (e) {
@@ -167,7 +229,7 @@ function parseAttachmentsForAgent(
     return [];
   }
 
-  const images: Array<{ type: 'image'; data: string; mimeType: string }> = [];
+  const results: Array<AttachmentForAgent> = [];
 
   for (const [idx, att] of attachments.entries()) {
     if (!att || typeof att.content !== 'string') {
@@ -175,7 +237,7 @@ function parseAttachmentsForAgent(
       continue;
     }
 
-    const mime = (att.mimeType ?? '').toLowerCase();
+    const mime = (att.mimeType ?? 'application/octet-stream').toLowerCase();
     let b64 = att.content.trim();
 
     // Strip data URL prefix if present
@@ -204,22 +266,35 @@ function parseAttachmentsForAgent(
       continue;
     }
 
-    // Check if it's an image
-    if (!mime.startsWith('image/')) {
-      log.warn?.(`[ATTACHMENT] Skipping attachment ${idx + 1}: not an image (${mime})`);
-      continue;
-    }
-
-    log.info(`[ATTACHMENT] Accepted image ${idx + 1}: ${mime}, ${Math.round(sizeBytes / 1024)}KB`);
+    // Determine attachment type based on MIME
+    const isImage = mime.startsWith('image/');
+    const sizeKB = Math.round(sizeBytes / 1024);
     
-    images.push({
-      type: 'image' as const,
-      data: b64,
-      mimeType: mime,
-    });
+    if (isImage) {
+      log.info(`[ATTACHMENT] Accepted image ${idx + 1}: ${mime}, ${sizeKB}KB`);
+      results.push({
+        type: 'image' as const,
+        data: b64,
+        mimeType: mime,
+      });
+    } else {
+      // Save non-image files to disk so agent can access via read tool
+      try {
+        const filePath = saveFileAttachment(b64, mime, att.fileName);
+        log.info(`[ATTACHMENT] Saved file ${idx + 1}: ${mime}, ${sizeKB}KB → ${filePath}`);
+        results.push({
+          type: 'file' as const,
+          path: filePath,
+          mimeType: mime,
+          fileName: att.fileName,
+        });
+      } catch (e) {
+        log.warn?.(`[ATTACHMENT] Failed to save file ${idx + 1}: ${(e as Error).message}`);
+      }
+    }
   }
 
-  return images;
+  return results;
 }
 
 async function processInboundQueue(
@@ -238,11 +313,18 @@ async function processInboundQueue(
     try {
       console.log(`[INBOUND] Processing #${msg.id} | attempt ${msg.retries + 1}`);
 
-      // Parse attachments (images) with proper validation and large file support
-      const images = parseAttachmentsForAgent(msg.attachments_json);
+      // Parse attachments (images and files) with proper validation
+      const allAttachments = parseAttachmentsForAgent(msg.attachments_json);
+      
+      // Separate images from files
+      const images = allAttachments.filter((a): a is { type: 'image'; data: string; mimeType: string } => a.type === 'image');
+      const files = allAttachments.filter((a): a is { type: 'file'; path: string; mimeType: string; fileName?: string } => a.type === 'file');
 
       if (images.length > 0) {
-        console.log(`[INBOUND] Message has ${images.length} validated image(s)`);
+        console.log(`[INBOUND] Message has ${images.length} image(s)`);
+      }
+      if (files.length > 0) {
+        console.log(`[INBOUND] Message has ${files.length} file(s): ${files.map(f => f.fileName || path.basename(f.path)).join(', ')}`);
       }
 
       // Get the plugin runtime with dispatch system
@@ -265,6 +347,7 @@ async function processInboundQueue(
       });
 
       // Build context like Telegram does - THIS IS THE KEY
+      // Include MediaPath/MediaPaths for file attachments (following Telegram pattern)
       const ctx = pluginRuntime.channel.reply.finalizeInboundContext({
         Body: msg.message_text,
         BodyForAgent: msg.message_text,
@@ -282,6 +365,11 @@ async function processInboundQueue(
         MessageSid: msg.message_id,
         SenderId: msg.chat_id,
         From: msg.chat_id,
+        // File attachments - passed via MediaPath like Telegram does
+        // This allows agent to access files via read tool
+        MediaPath: files.length > 0 ? files[0].path : undefined,
+        MediaPaths: files.length > 0 ? files.map(f => f.path) : undefined,
+        MediaTypes: files.length > 0 ? files.map(f => f.mimeType) : undefined,
       });
 
       // Record session metadata

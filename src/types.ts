@@ -248,10 +248,29 @@ export interface LarkTokenCache {
 
 // ─── Attachment Types ────────────────────────────────────────────
 
-export interface Attachment {
+/**
+ * Image attachment (base64 encoded)
+ */
+export interface ImageAttachment {
+  type?: 'image';
   mimeType: string;
   content: string;  // base64
 }
+
+/**
+ * File attachment (saved to disk)
+ */
+export interface FileAttachment {
+  type: 'file';
+  path: string;
+  mimeType: string;
+  fileName?: string;
+}
+
+/**
+ * Combined attachment type
+ */
+export type Attachment = ImageAttachment | FileAttachment;
 
 export interface ParsedPostContent {
   texts: string[];

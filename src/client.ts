@@ -326,6 +326,122 @@ export class LarkClient {
     }
   }
 
+  // ─── File Operations ─────────────────────────────────────────────
+
+  /**
+   * Download a file attachment from a message (zip, pdf, doc, etc.)
+   * API: GET /im/v1/messages/{message_id}/resources/{file_key}?type=file
+   */
+  async downloadFile(fileKey: string, messageId: string, fileName?: string): Promise<{
+    base64: string;
+    mimeType: string;
+    fileName: string;
+    sizeBytes: number;
+  } | null> {
+    try {
+      const token = await this.getTenantToken();
+      if (!token) return null;
+
+      const domain = this.domain === 'feishu'
+        ? 'https://open.feishu.cn'
+        : 'https://open.larksuite.com';
+
+      const url = `${domain}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=file`;
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        console.error(`[LARK-FILE] Download failed: HTTP ${res.status} for ${fileKey}`);
+        return null;
+      }
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const sizeKB = Math.round(buffer.byteLength / 1024);
+      console.log(`[LARK-FILE] Downloaded ${sizeKB}KB: ${fileName ?? fileKey}`);
+
+      // Determine content type from response or file extension
+      let mimeType = res.headers.get('content-type') ?? 'application/octet-stream';
+      if (fileName) {
+        const ext = fileName.split('.').pop()?.toLowerCase();
+        const extMap: Record<string, string> = {
+          'zip': 'application/zip',
+          'pdf': 'application/pdf',
+          'doc': 'application/msword',
+          'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'xls': 'application/vnd.ms-excel',
+          'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'ppt': 'application/vnd.ms-powerpoint',
+          'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'txt': 'text/plain',
+          'csv': 'text/csv',
+          'json': 'application/json',
+          'xml': 'application/xml',
+          'html': 'text/html',
+          'md': 'text/markdown',
+        };
+        if (ext && extMap[ext]) {
+          mimeType = extMap[ext];
+        }
+      }
+
+      return {
+        base64: buffer.toString('base64'),
+        mimeType,
+        fileName: fileName ?? fileKey,
+        sizeBytes: buffer.byteLength,
+      };
+    } catch (e) {
+      console.error('[LARK-FILE-ERROR]', (e as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Download an audio message from Lark
+   * Audio content format: { "file_key": "...", "duration": 1000 }
+   */
+  async downloadAudio(fileKey: string, messageId: string, duration?: number): Promise<{
+    base64: string;
+    mimeType: string;
+    durationMs: number;
+    sizeBytes: number;
+  } | null> {
+    try {
+      const token = await this.getTenantToken();
+      if (!token) return null;
+
+      const domain = this.domain === 'feishu'
+        ? 'https://open.feishu.cn'
+        : 'https://open.larksuite.com';
+
+      const url = `${domain}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=file`;
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        console.error(`[LARK-AUDIO] Download failed: HTTP ${res.status} for ${fileKey}`);
+        return null;
+      }
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const sizeKB = Math.round(buffer.byteLength / 1024);
+      const durationSec = duration ? Math.round(duration / 1000) : 0;
+      console.log(`[LARK-AUDIO] Downloaded ${sizeKB}KB, ${durationSec}s: ${fileKey}`);
+
+      return {
+        base64: buffer.toString('base64'),
+        mimeType: 'audio/ogg', // Lark audio is typically opus in ogg container
+        durationMs: duration ?? 0,
+        sizeBytes: buffer.byteLength,
+      };
+    } catch (e) {
+      console.error('[LARK-AUDIO-ERROR]', (e as Error).message);
+      return null;
+    }
+  }
+
   // ─── Content Parsing ───────────────────────────────────────────
 
   /**
