@@ -498,12 +498,13 @@ export class WebhookHandler {
           for (const key of imageKeys) {
             const img = await this.config.client.downloadImage(key, messageId);
             if (img && img.content) {
-              // Save image to disk like files
+              // Save image to disk AND keep content for gateway compatibility
               const ext = img.mimeType?.includes('png') ? '.png' : '.jpg';
               const imagePath = this.saveFileAttachment(img.content, img.mimeType, `image_${messageId}_${Date.now()}${ext}`);
               attachments.push({
                 type: 'image',
-                path: imagePath,
+                content: img.content,  // REQUIRED: gateway needs base64 content
+                path: imagePath,       // Optional: disk path for read tool
                 mimeType: img.mimeType,
               });
             }
@@ -517,12 +518,13 @@ export class WebhookHandler {
             if (content.image_key) {
               const img = await this.config.client.downloadImage(content.image_key, messageId);
               if (img && img.content) {
-                // Save image to disk like files
+                // Save image to disk AND keep content for gateway compatibility
                 const ext = img.mimeType?.includes('png') ? '.png' : '.jpg';
                 const imagePath = this.saveFileAttachment(img.content, img.mimeType, `image_${messageId}_${Date.now()}${ext}`);
                 attachments.push({
                   type: 'image',
-                  path: imagePath,
+                  content: img.content,  // REQUIRED: gateway needs base64 content
+                  path: imagePath,       // Optional: disk path for read tool
                   mimeType: img.mimeType,
                 });
               }
