@@ -313,6 +313,18 @@ export class WebhookHandler {
       return;
     }
 
+    // Handle card action callbacks (synchronous - need to respond with card update)
+    if (
+      data.schema === '2.0' &&
+      data.header?.event_type === 'card.action.trigger' &&
+      data.event
+    ) {
+      const cardResponse = await this.handleCardCallback(data.event);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(cardResponse));
+      return;
+    }
+
     // Respond immediately (async processing)
     res.writeHead(200);
     res.end('ok');
@@ -324,6 +336,76 @@ export class WebhookHandler {
       data.event
     ) {
       await this.handleMessageEvent(data.event);
+    }
+  }
+
+  /**
+   * Handle card action callback (button clicks, form submissions)
+   * Returns card update or toast to Lark
+   */
+  private async handleCardCallback(event: any): Promise<any> {
+    try {
+      const operator = event.operator;
+      const action = event.action;
+      const context = event.context;
+
+      const userId = operator?.open_id;
+      const chatId = context?.open_chat_id;
+      const messageId = context?.open_message_id;
+
+      console.log(`[WEBHOOK] Card callback: user=${userId}, chat=${chatId}, action=`, action);
+
+      // Extract action info
+      const actionValue = action?.value || {};
+      const formValue = action?.form_value || {};
+      const actionName = actionValue.action || action?.tag || 'unknown';
+
+      // ID Note skill handling
+      if (actionName === 'add_entry' || actionName === 'finish' || actionName === 'cancel' || actionName === 'new_session') {
+        // Call idnote skill handler
+        try {
+          const homeDir = process.env.HOME || '/root';
+          const idnotePath = `${homeDir}/.openclaw/workspace/skills/idnote/src/index.js`;
+          const idnote = await import(idnotePath);
+          
+          const result = await idnote.handleCardCallback(
+            actionName,
+            formValue,
+            userId,
+            chatId,
+            messageId
+          );
+
+          // Return card update or toast
+          if (result.card) {
+            return { card: result.card };
+          }
+          if (result.toast) {
+            return { toast: result.toast };
+          }
+          return {};
+        } catch (e) {
+          console.error('[WEBHOOK] ID Note handler error:', e);
+          return {
+            toast: {
+              type: 'error',
+              content: `处理失败: ${(e as Error).message}`,
+            },
+          };
+        }
+      }
+
+      // Unknown action - just acknowledge
+      console.log('[WEBHOOK] Unknown card action:', actionName);
+      return {};
+    } catch (e) {
+      console.error('[WEBHOOK] Card callback error:', e);
+      return {
+        toast: {
+          type: 'error',
+          content: '处理失败',
+        },
+      };
     }
   }
 
