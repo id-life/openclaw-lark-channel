@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
-import { decryptPayload, shouldRespondInGroup } from '../src/webhook.js';
+import { decryptPayload, shouldAllowDmByPolicy, shouldRespondInGroup } from '../src/webhook.js';
 
 describe('Webhook', () => {
   describe('decryptPayload', () => {
@@ -54,6 +54,27 @@ describe('Webhook', () => {
       expect(shouldRespondInGroup('Just chatting here', [], false)).toBe(false);
       expect(shouldRespondInGroup('Meeting at 3pm', [], false)).toBe(false);
       expect(shouldRespondInGroup('Ok sounds good', [], false)).toBe(false);
+    });
+  });
+
+  describe('shouldAllowDmByPolicy', () => {
+    it('should always allow for open policy', () => {
+      expect(shouldAllowDmByPolicy({ policy: 'open', chatId: 'oc_any' })).toBe(true);
+    });
+
+    it('should enforce allowlist policy', () => {
+      const allowlist = new Set(['oc_allowed']);
+      expect(shouldAllowDmByPolicy({ policy: 'allowlist', chatId: 'oc_allowed', dmAllowlist: allowlist })).toBe(true);
+      expect(shouldAllowDmByPolicy({ policy: 'allowlist', chatId: 'oc_blocked', dmAllowlist: allowlist })).toBe(false);
+      expect(shouldAllowDmByPolicy({ policy: 'allowlist', chatId: 'oc_blocked' })).toBe(false);
+    });
+
+    it('should allow pairing policy without allowlist and enforce when provided', () => {
+      expect(shouldAllowDmByPolicy({ policy: 'pairing', chatId: 'oc_any' })).toBe(true);
+
+      const allowlist = new Set(['oc_allowed']);
+      expect(shouldAllowDmByPolicy({ policy: 'pairing', chatId: 'oc_allowed', dmAllowlist: allowlist })).toBe(true);
+      expect(shouldAllowDmByPolicy({ policy: 'pairing', chatId: 'oc_blocked', dmAllowlist: allowlist })).toBe(false);
     });
   });
 });

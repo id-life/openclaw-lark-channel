@@ -47,6 +47,8 @@ export const LarkConfigSchema = z.object({
     .describe('Direct message security policy'),
   dmAllowlist: z.array(z.string()).optional()
     .describe('List of allowed chat IDs for DM allowlist policy'),
+  replyToMode: z.enum(['off', 'first', 'all']).optional().default('all')
+    .describe('Thread reply mode when replying to message threads'),
   allowFrom: z.array(z.string()).optional()
     .describe('List of allowed Lark user IDs (for allowlist policy)'),
   

@@ -350,17 +350,29 @@ async function processInboundQueue(
       // If dmScope is not set, default to 'per-channel-peer' for proper Lark session isolation
       const sessionConfig = cfg.session as { dmScope?: string } | undefined;
       const dmScope = sessionConfig?.dmScope ?? 'per-channel-peer';
+      const routeCfg = sessionConfig?.dmScope
+        ? cfg
+        : {
+            ...cfg,
+            session: {
+              ...(sessionConfig ?? {}),
+              dmScope,
+            },
+          };
       
       // Log config state for debugging session key issues
       console.log(`[INBOUND] Config check: dmScope=${dmScope}, hasSessionConfig=${!!sessionConfig}`);
       
-      // Derive chat type from chat_id pattern (og_ = group, oc_ = DM)
-      const isGroup = msg.chat_id.startsWith('og_');
-      const chatType: 'direct' | 'group' = isGroup ? 'group' : 'direct';
+      // Use webhook-provided chat type when available; fallback to chat_id prefix for legacy rows.
+      const chatType: 'direct' | 'group' =
+        msg.chat_type === 'group' || msg.chat_type === 'direct'
+          ? msg.chat_type
+          : (msg.chat_id.startsWith('og_') ? 'group' : 'direct');
+      const isGroup = chatType === 'group';
       
       // Resolve routing - use same signature as Telegram
       const route = pluginRuntime.channel.routing.resolveAgentRoute({
-        cfg,
+        cfg: routeCfg,
         channel: 'lark',
         accountId: 'default',
         peer: {
@@ -451,9 +463,9 @@ async function processInboundQueue(
       
       const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx,
-        cfg,
+        cfg: routeCfg,
         dispatcherOptions: {
-          deliver: async (payload, info) => {
+          deliver: async (payload: { text?: string; mediaUrl?: string; replyToId?: string }, info) => {
             deliverCallCount++;
             lastDeliveryKind = info.kind;
             debugLog(`deliver() called #${deliverCallCount}: kind=${info.kind}, hasText=${!!payload.text}, textLen=${payload.text?.length ?? 0}`);
@@ -470,8 +482,16 @@ async function processInboundQueue(
             debugLog(`Delivering ${info.kind}: ${text.length} chars to ${msg.chat_id}`);
             console.log(`[DISPATCH] Delivering ${info.kind}: ${text.length} chars to ${msg.chat_id}`);
             
+            // Prefer dispatcher replyToId (if set); otherwise keep group replies in the current thread root.
+            const payloadReplyToId =
+              typeof payload.replyToId === 'string' ? payload.replyToId.trim() : '';
+            const rootId = payloadReplyToId || (isGroup ? (msg.thread_root_id ?? msg.message_id) : undefined);
+
             // Send to Lark
-            await sendToLark(client, msg.chat_id, text, route.sessionKey);
+            await sendToLark(client, msg.chat_id, text, {
+              sessionKey: route.sessionKey,
+              rootId,
+            });
             debugLog(`✅ Sent ${info.kind} to Lark`);
             console.log(`[DISPATCH] ✅ Sent ${info.kind} to Lark`);
           },
@@ -542,7 +562,9 @@ async function processOutboundQueue(
     try {
       console.log(`[OUTBOUND] Processing #${msg.id} (${msg.queue_type}) | attempt ${msg.retries + 1}`);
 
-      const result = await sendToLark(client, msg.chat_id, msg.content, msg.session_key);
+      const result = await sendToLark(client, msg.chat_id, msg.content, {
+        sessionKey: msg.session_key,
+      });
 
       if (result.skipped) {
         queue.markOutboundCompleted(msg.id, null);
@@ -625,7 +647,10 @@ async function sendToLarkWithRetry(
   client: LarkClient,
   chatId: string,
   content: string,
-  sessionKey?: string
+  options?: {
+    sessionKey?: string;
+    rootId?: string;
+  }
 ): Promise<{ skipped?: boolean; messageId?: string; error?: string }> {
   const msgType = selectMessageType(content);
 
@@ -638,13 +663,14 @@ async function sendToLarkWithRetry(
   for (let attempt = 1; attempt <= SEND_MAX_RETRIES; attempt++) {
     try {
       let result: { success: boolean; messageId?: string; error?: string };
+      const rootId = options?.rootId?.trim();
 
       if (msgType === 'text') {
-        result = await client.sendText(chatId, content);
+        result = await client.sendText(chatId, content, { rootId });
       } else {
         // Interactive card
-        const card = buildCard({ text: content, sessionKey });
-        result = await client.sendCard(chatId, card);
+        const card = buildCard({ text: content, sessionKey: options?.sessionKey });
+        result = await client.sendCard(chatId, card, { rootId });
       }
 
       if (result.success) {
@@ -697,7 +723,7 @@ export const larkPlugin = {
   capabilities: {
     chatTypes: ['direct', 'group'] as const,
     reactions: false,
-    threads: false,
+    threads: true,
     media: true,
     nativeCommands: false,
     blockStreaming: true,
@@ -758,6 +784,11 @@ export const larkPlugin = {
     },
   },
 
+  threading: {
+    resolveReplyToMode: ({ cfg, accountId }: { cfg: { channels?: { lark?: LarkChannelConfig } }; accountId?: string }) =>
+      resolveLarkAccount({ cfg, accountId }).config.replyToMode ?? 'all',
+  },
+
   messaging: {
     normalizeTarget: (target: string) => {
       const trimmed = target.trim();
@@ -806,14 +837,42 @@ export const larkPlugin = {
     chunkerMode: 'markdown' as const,
     textChunkLimit: 30000,
 
-    sendText: async ({ to, text }: { to: string; text: string; accountId?: string }) => {
+    sendText: async ({
+      to,
+      text,
+      replyToId,
+      threadId,
+    }: {
+      to: string;
+      text: string;
+      accountId?: string;
+      replyToId?: string | null;
+      threadId?: string | number | null;
+    }) => {
       const client = getLarkClient();
-      const result = await sendToLark(client, to, text);
+      const rootId = (replyToId ?? threadId)?.toString().trim();
+      const result = await sendToLark(client, to, text, {
+        rootId: rootId || undefined,
+      });
       return { channel: 'lark' as const, ...result };
     },
 
-    sendMedia: async ({ to, text, mediaUrl }: { to: string; text?: string; mediaUrl: string; accountId?: string }) => {
+    sendMedia: async ({
+      to,
+      text,
+      mediaUrl,
+      replyToId,
+      threadId,
+    }: {
+      to: string;
+      text?: string;
+      mediaUrl: string;
+      accountId?: string;
+      replyToId?: string | null;
+      threadId?: string | number | null;
+    }) => {
       const client = getLarkClient();
+      const rootId = (replyToId ?? threadId)?.toString().trim();
 
       // Upload image
       const uploadResult = await client.uploadImageFromUrl(mediaUrl);
@@ -837,7 +896,9 @@ export const larkPlugin = {
         ...(card.elements ?? []),
       ];
 
-      const result = await client.sendCard(to, card);
+      const result = await client.sendCard(to, card, {
+        rootId: rootId || undefined,
+      });
       return { channel: 'lark' as const, messageId: result.messageId, error: result.error };
     },
   },
@@ -964,6 +1025,9 @@ export const larkPlugin = {
       const groupAllowlist = account.config.groups
         ? new Set(Object.keys(account.config.groups))
         : undefined;
+      const dmAllowlist = account.config.dmAllowlist
+        ? new Set(account.config.dmAllowlist)
+        : undefined;
 
       // Start webhook
       const webhook = new WebhookHandler({
@@ -975,6 +1039,8 @@ export const larkPlugin = {
         sessionKeyPrefix: 'lark',
         groupRequireMention: true,
         groupAllowlist,
+        dmPolicy: account.config.dmPolicy,
+        dmAllowlist,
       });
 
       await webhook.start();

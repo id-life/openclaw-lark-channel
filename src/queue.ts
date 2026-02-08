@@ -81,6 +81,7 @@ export class MessageQueue {
     this.db.pragma('synchronous = NORMAL');
 
     this.initializeSchema();
+    this.migrateSchema();
     this.resetStuckMessages();
 
     // Initialize prepared statements
@@ -128,8 +129,8 @@ export class MessageQueue {
 
     this.stmtEnqueueInbound = this.db.prepare(`
       INSERT OR IGNORE INTO inbound_queue 
-        (message_id, chat_id, session_key, message_text, attachments_json, status, created_at, updated_at, next_retry_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        (message_id, thread_root_id, chat_type, chat_id, session_key, message_text, attachments_json, status, created_at, updated_at, next_retry_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
     `);
 
     this.stmtDequeueInbound = this.db.prepare(`
@@ -190,6 +191,8 @@ export class MessageQueue {
       CREATE TABLE IF NOT EXISTS inbound_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message_id TEXT NOT NULL UNIQUE,  -- Lark message_id for dedup
+        thread_root_id TEXT,              -- Lark thread root message_id (for threaded replies)
+        chat_type TEXT NOT NULL DEFAULT 'direct', -- 'direct' or 'group'
         chat_id TEXT NOT NULL,
         session_key TEXT NOT NULL,
         message_text TEXT NOT NULL,
@@ -206,6 +209,7 @@ export class MessageQueue {
       
       CREATE INDEX IF NOT EXISTS idx_inbound_status ON inbound_queue(status, next_retry_at);
       CREATE INDEX IF NOT EXISTS idx_inbound_msgid ON inbound_queue(message_id);
+      CREATE INDEX IF NOT EXISTS idx_inbound_chat_type ON inbound_queue(chat_type, chat_id);
       
       -- Sent message tracking (for dedup)
       CREATE TABLE IF NOT EXISTS sent_messages (
@@ -218,6 +222,20 @@ export class MessageQueue {
       
       CREATE INDEX IF NOT EXISTS idx_sent_hash ON sent_messages(content_hash, chat_id, created_at);
     `);
+  }
+
+  private migrateSchema(): void {
+    this.ensureColumn('inbound_queue', 'thread_root_id', 'TEXT');
+    this.ensureColumn('inbound_queue', 'chat_type', `TEXT NOT NULL DEFAULT 'direct'`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_inbound_chat_type ON inbound_queue(chat_type, chat_id)`);
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (rows.some((row) => row.name === column)) {
+      return;
+    }
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   /**
@@ -389,6 +407,8 @@ export class MessageQueue {
    */
   enqueueInbound(params: {
     messageId: string;
+    threadRootId?: string | null;
+    chatType?: 'direct' | 'group';
     chatId: string;
     sessionKey: string;
     messageText: string;
@@ -403,8 +423,12 @@ export class MessageQueue {
     }
 
     const attachmentsJson = params.attachments ? JSON.stringify(params.attachments) : null;
+    const chatType = params.chatType ?? 'direct';
+    const threadRootId = params.threadRootId?.trim() ? params.threadRootId.trim() : null;
     const result = this.stmtEnqueueInbound.run(
       params.messageId,
+      threadRootId,
+      chatType,
       params.chatId,
       params.sessionKey,
       params.messageText,

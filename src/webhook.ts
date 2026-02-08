@@ -78,9 +78,32 @@ export function shouldRespondInGroup(
 
 // ─── Webhook Handler ─────────────────────────────────────────────
 
-// ⚠️ HARDCODED: Only Boyang's chat ID is allowed for DMs
-// Per Boyang's explicit instruction: "just allow me and only me. Hard code."
-const ALLOWED_DM_CHAT_ID = 'oc_289754d98cefc623207a174739837c29';
+export type LarkDmPolicy = 'open' | 'pairing' | 'allowlist';
+
+/**
+ * Evaluate whether an inbound DM is allowed.
+ * - open: always allow
+ * - allowlist: require chat ID in dmAllowlist
+ * - pairing: if dmAllowlist exists, enforce it; otherwise allow and defer to gateway pairing flow
+ */
+export function shouldAllowDmByPolicy(params: {
+  policy?: LarkDmPolicy;
+  chatId: string;
+  dmAllowlist?: Set<string>;
+}): boolean {
+  const policy = params.policy ?? 'pairing';
+  const allowlist = params.dmAllowlist;
+
+  if (policy === 'open') {
+    return true;
+  }
+
+  if (allowlist && allowlist.size > 0) {
+    return allowlist.has(params.chatId);
+  }
+
+  return policy === 'pairing';
+}
 
 export interface WebhookConfig {
   port: number;
@@ -92,7 +115,7 @@ export interface WebhookConfig {
   sessionKeyPrefix?: string;
   groupRequireMention?: boolean;
   groupAllowlist?: Set<string>;
-  // DM filtering - if empty/undefined, only ALLOWED_DM_CHAT_ID is allowed (hardcoded)
+  dmPolicy?: LarkDmPolicy;
   dmAllowlist?: Set<string>;
 }
 
@@ -620,22 +643,24 @@ export class WebhookHandler {
         return;
       }
 
+      const inboundChatType: 'direct' | 'group' = message.chat_type === 'group' ? 'group' : 'direct';
+
       // DM filtering (non-group chats)
-      if (message?.chat_type !== 'group') {
-        // ⚠️ HARDCODED: Only allow Boyang's chat ID
-        // Other DMs are silently ignored for security
-        const allowed = this.config.dmAllowlist 
-          ? this.config.dmAllowlist.has(chatId)
-          : chatId === ALLOWED_DM_CHAT_ID;
-        
+      if (inboundChatType !== 'group') {
+        const allowed = shouldAllowDmByPolicy({
+          policy: this.config.dmPolicy,
+          chatId,
+          dmAllowlist: this.config.dmAllowlist,
+        });
+
         if (!allowed) {
-          console.log(`[WEBHOOK] 🚫 Ignoring DM from ${chatId} (not in allowlist)`);
+          console.log(`[WEBHOOK] 🚫 Ignoring DM from ${chatId} (blocked by dmPolicy=${this.config.dmPolicy ?? 'pairing'})`);
           return;
         }
       }
 
       // Group chat filtering
-      if (message?.chat_type === 'group') {
+      if (inboundChatType === 'group') {
         const mentions = message.mentions ?? [];
 
         // Check allowlist
@@ -659,11 +684,17 @@ export class WebhookHandler {
       // The consumer will use chat_id to compute the correct session key at processing time
       // This placeholder is only for queue schema compatibility
       const sessionKey = `lark:${chatId}`;  // Placeholder - consumer ignores this
+      const threadRootId =
+        inboundChatType === 'group'
+          ? (message.root_id?.trim() || message.message_id?.trim() || null)
+          : null;
       const messageText = text || '[User sent an image]';
 
       // ⚡ PERSIST IMMEDIATELY - no message loss
       const result = this.config.queue.enqueueInbound({
         messageId,
+        threadRootId,
+        chatType: inboundChatType,
         chatId,
         sessionKey,
         messageText,

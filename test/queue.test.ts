@@ -154,6 +154,25 @@ describe('MessageQueue', () => {
       const attachments = JSON.parse(messages[0].attachments_json!);
       expect(attachments[0].mimeType).toBe('image/png');
     });
+
+    it('should persist chat type and thread root id', () => {
+      const result = queue.enqueueInbound({
+        messageId: 'msg_threaded',
+        threadRootId: 'msg_root_1',
+        chatType: 'group',
+        chatId: 'oc_group',
+        sessionKey: 'lark:oc_group',
+        messageText: 'reply in thread',
+        attachments: null,
+      });
+
+      expect(result.enqueued).toBe(true);
+
+      const messages = queue.dequeueInbound(10);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].chat_type).toBe('group');
+      expect(messages[0].thread_root_id).toBe('msg_root_1');
+    });
   });
 
   describe('Outbound Queue', () => {

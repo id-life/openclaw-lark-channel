@@ -23,6 +23,10 @@ import type {
 
 // ─── Client Class ────────────────────────────────────────────────
 
+interface LarkSendOptions {
+  rootId?: string;
+}
+
 export class LarkClient {
   private sdk: LarkSDK.Client;
   private appId: string;
@@ -160,14 +164,16 @@ export class LarkClient {
   /**
    * Send a text message
    */
-  async sendText(chatId: string, text: string): Promise<LarkSendResult> {
+  async sendText(chatId: string, text: string, options?: LarkSendOptions): Promise<LarkSendResult> {
     try {
+      const rootId = options?.rootId?.trim();
       const res = await this.sdk.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
           msg_type: 'text',
           content: JSON.stringify({ text }),
+          ...(rootId ? { root_id: rootId } : {}),
         },
       });
 
@@ -184,14 +190,16 @@ export class LarkClient {
   /**
    * Send an interactive card message
    */
-  async sendCard(chatId: string, card: LarkCard): Promise<LarkSendResult> {
+  async sendCard(chatId: string, card: LarkCard, options?: LarkSendOptions): Promise<LarkSendResult> {
     try {
+      const rootId = options?.rootId?.trim();
       const res = await this.sdk.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
           msg_type: 'interactive',
           content: JSON.stringify(card),
+          ...(rootId ? { root_id: rootId } : {}),
         },
       });
 
@@ -208,14 +216,16 @@ export class LarkClient {
   /**
    * Send a post (rich text) message
    */
-  async sendPost(chatId: string, content: object): Promise<LarkSendResult> {
+  async sendPost(chatId: string, content: object, options?: LarkSendOptions): Promise<LarkSendResult> {
     try {
+      const rootId = options?.rootId?.trim();
       const res = await this.sdk.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
           msg_type: 'post',
           content: JSON.stringify(content),
+          ...(rootId ? { root_id: rootId } : {}),
         },
       });
 
@@ -232,14 +242,16 @@ export class LarkClient {
   /**
    * Send an image message
    */
-  async sendImage(chatId: string, imageKey: string): Promise<LarkSendResult> {
+  async sendImage(chatId: string, imageKey: string, options?: LarkSendOptions): Promise<LarkSendResult> {
     try {
+      const rootId = options?.rootId?.trim();
       const res = await this.sdk.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
           msg_type: 'image',
           content: JSON.stringify({ image_key: imageKey }),
+          ...(rootId ? { root_id: rootId } : {}),
         },
       });
 

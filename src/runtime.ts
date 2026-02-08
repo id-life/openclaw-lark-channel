@@ -22,7 +22,10 @@ export interface LarkPluginRuntime {
         dispatcherOptions: {
           responsePrefix?: string;
           responsePrefixContextProvider?: () => Record<string, unknown>;
-          deliver: (payload: { text?: string; mediaUrl?: string }, info: { kind: string }) => Promise<void>;
+          deliver: (
+            payload: { text?: string; mediaUrl?: string; mediaUrls?: string[]; replyToId?: string; threadId?: string | number | null },
+            info: { kind: string }
+          ) => Promise<void>;
           onSkip?: (payload: unknown, info: { reason: string }) => void;
           onError?: (err: Error, info: { kind: string }) => void;
           onReplyStart?: () => void;

@@ -15,7 +15,9 @@ export interface LarkChannelConfig {
   webhookBind?: string;
   enabled?: boolean;
   dmPolicy?: 'open' | 'pairing' | 'allowlist';
+  dmAllowlist?: string[];
   allowFrom?: string[];
+  replyToMode?: 'off' | 'first' | 'all';
   groupPolicy?: 'open' | 'allowlist' | 'deny';
   groups?: Record<string, LarkGroupConfig>;
   queueDbPath?: string;
@@ -63,6 +65,8 @@ export interface QueueMessage {
 
 export interface InboundMessage extends QueueMessage {
   message_id: string;
+  thread_root_id: string | null;
+  chat_type: 'direct' | 'group';
   chat_id: string;
   session_key: string;
   message_text: string;
